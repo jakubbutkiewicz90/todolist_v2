@@ -357,7 +357,7 @@ fun TopBar(
                     .clip(RoundedCornerShape(16.dp))
                     .combinedClickable(
                         onClick = { isDropdownExpanded = true },
-                        onLongClick = onRenameListClicked
+                        onLongClick = if (selectedList != null) onRenameListClicked else null
                     ),
                 contentAlignment = Alignment.CenterStart
             ){

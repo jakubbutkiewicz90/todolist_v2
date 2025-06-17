@@ -7,12 +7,14 @@ import com.example.todolist_v2.repository.FirestoreRepository
 import com.example.todolist_v2.repository.ShoppingRepository
 import com.example.todolist_v2.repository.ToDoRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
+@OptIn(ExperimentalCoroutinesApi::class)
 @HiltViewModel
 class SyncViewModel @Inject constructor(
     private val todoRepository: ToDoRepository,
@@ -24,35 +26,43 @@ class SyncViewModel @Inject constructor(
         viewModelScope.launch {
             Log.d("SyncDebug", "===> ROZPOCZĘTO SYNCHRONIZACJĘ DLA UŻYTKOWNIKA: $userId <===")
 
-
-            val localTodoLists = todoRepository.getListsByOwner(userId).firstOrNull() ?: emptyList()
+            val localTodoLists = todoRepository.getAllListsForSync(userId)
             val firestoreTodoLists = firestoreRepository.getTodoListsFromFirestore(userId)
-            val localShops = shoppingRepository.getShopsByOwner(userId).firstOrNull() ?: emptyList()
+            val localShops = shoppingRepository.getAllShopsForSync(userId)
             val firestoreShops = firestoreRepository.getShopsFromFirestore(userId)
-
-            Log.d("SyncDebug", "Lokalne listy: ${localTodoLists.size}, Listy z Firestore: ${firestoreTodoLists.size}")
-            Log.d("SyncDebug", "Lokalne sklepy: ${localShops.size}, Sklepy z Firestore: ${firestoreShops.size}")
-
 
             val mergedTodoLists = merge(localTodoLists, firestoreTodoLists) { it.id }
             mergedTodoLists.forEach { (local, remote) ->
-
                 when {
                     local == null && remote != null -> {
-                        Log.d("SyncDebug", "Firestore -> Room (Insert List): ${remote.name}")
-                        todoRepository.insertList(remote)
+                        if (!remote.isDeleted) {
+                            Log.d("SyncDebug", "Firestore -> Room (Insert List): ${remote.name}")
+                            todoRepository.insertList(remote)
+                        }
                     }
                     local != null && remote == null -> {
                         Log.d("SyncDebug", "Room -> Firestore (Save List): ${local.name}")
-                        firestoreRepository.saveToDoListToFirestore(local.copy(owner = userId))
+                        if (userId != "default_user") {
+                            firestoreRepository.saveToDoListToFirestore(local.copy(owner = userId))
+                        }
                     }
                     local != null && remote != null -> {
-                        if (local.lastModified > remote.lastModified) {
-                            Log.d("SyncDebug", "Room -> Firestore (Update List): ${local.name}")
-                            firestoreRepository.saveToDoListToFirestore(local.copy(owner = userId))
-                        } else if (remote.lastModified > local.lastModified) {
-                            Log.d("SyncDebug", "Firestore -> Room (Update List): ${remote.name}")
-                            todoRepository.updateList(remote)
+                        when {
+                            remote.lastModified > local.lastModified -> {
+                                if (remote.isDeleted) {
+                                    Log.d("SyncDebug", "Firestore -> Room (Delete List Permanently): ${remote.name}")
+                                    todoRepository.deleteListPermanently(remote.id)
+                                } else {
+                                    Log.d("SyncDebug", "Firestore -> Room (Update List): ${remote.name}")
+                                    todoRepository.updateList(remote)
+                                }
+                            }
+                            local.lastModified > remote.lastModified -> {
+                                Log.d("SyncDebug", "Room -> Firestore (Update List): ${local.name}")
+                                if (userId != "default_user") {
+                                    firestoreRepository.saveToDoListToFirestore(local.copy(owner = userId))
+                                }
+                            }
                         }
                     }
                 }
@@ -62,49 +72,72 @@ class SyncViewModel @Inject constructor(
             mergedShops.forEach { (local, remote) ->
                 when {
                     local == null && remote != null -> {
-                        Log.d("SyncDebug", "Firestore -> Room (Insert Shop): ${remote.name}")
-                        shoppingRepository.insertShop(remote)
+                        if (!remote.isDeleted) {
+                            Log.d("SyncDebug", "Firestore -> Room (Insert Shop): ${remote.name}")
+                            shoppingRepository.insertShop(remote)
+                        }
                     }
                     local != null && remote == null -> {
                         Log.d("SyncDebug", "Room -> Firestore (Save Shop): ${local.name}")
-                        firestoreRepository.saveShopToFirestore(local.copy(owner = userId))
+                        if (userId != "default_shopping_user") {
+                            firestoreRepository.saveShopToFirestore(local.copy(owner = userId))
+                        }
                     }
                     local != null && remote != null -> {
-                        if (local.lastModified > remote.lastModified) {
-                            Log.d("SyncDebug", "Room -> Firestore (Update Shop): ${local.name}")
-                            firestoreRepository.saveShopToFirestore(local.copy(owner = userId))
-                        } else if (remote.lastModified > local.lastModified) {
-                            Log.d("SyncDebug", "Firestore -> Room (Update Shop): ${remote.name}")
-                            shoppingRepository.updateShop(remote)
+                        when {
+                            remote.lastModified > local.lastModified -> {
+                                if (remote.isDeleted) {
+                                    Log.d("SyncDebug", "Firestore -> Room (Delete Shop Permanently): ${remote.name}")
+                                    shoppingRepository.deleteShopPermanently(remote.id)
+                                } else {
+                                    Log.d("SyncDebug", "Firestore -> Room (Update Shop): ${remote.name}")
+                                    shoppingRepository.updateShop(remote)
+                                }
+                            }
+                            local.lastModified > remote.lastModified -> {
+                                Log.d("SyncDebug", "Room -> Firestore (Update Shop): ${local.name}")
+                                if (userId != "default_shopping_user") {
+                                    firestoreRepository.saveShopToFirestore(local.copy(owner = userId))
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            val allLocalListsAfterSync = todoRepository.getListsByOwner(userId).firstOrNull() ?: emptyList()
-            Log.d("SyncDebug", "Rozpoczynanie synchronizacji zadań dla ${allLocalListsAfterSync.size} list.")
+            Log.d("SyncDebug", "Rozpoczynanie synchronizacji zadań...")
+            val allActiveListsAfterSync = todoRepository.getActiveListsByOwner(userId).firstOrNull() ?: emptyList()
 
-            allLocalListsAfterSync.map { list ->
+            allActiveListsAfterSync.map { list ->
                 async {
-                    val localTasks = todoRepository.getTasksForList(list.id).firstOrNull() ?: emptyList()
+                    val localTasks = todoRepository.getAllTasksForListSync(list.id)
                     val firestoreTasks = firestoreRepository.getTasksForListFromFirestore(list.id)
-
-                    Log.d("SyncDebug", "Lista '${list.name}': Lokalne zadania: ${localTasks.size}, Zadania z Firestore: ${firestoreTasks.size}")
 
                     val mergedTasks = merge(localTasks, firestoreTasks) { it.id }
                     mergedTasks.forEach { (localTask, remoteTask) ->
                         when {
+
                             localTask == null && remoteTask != null -> {
-                                Log.d("SyncDebug", "Firestore -> Room (Insert Task): ${remoteTask.title}")
-                                todoRepository.insertTask(remoteTask)
+                                if (!remoteTask.isDeleted) {
+                                    todoRepository.insertTask(remoteTask)
+                                }
                             }
+
                             localTask != null && remoteTask == null -> {
-                                Log.d("SyncDebug", "Room -> Firestore (Save Task): ${localTask.title}")
                                 firestoreRepository.saveTaskToFirestore(localTask)
                             }
+
                             localTask != null && remoteTask != null -> {
-                                if (localTask != remoteTask) {
-                                    Log.d("SyncDebug", "Firestore -> Room (Update Task): ${remoteTask.title}")
+
+                                if (remoteTask.isDeleted && !localTask.isDeleted) {
+                                    todoRepository.deleteTaskPermanently(localTask.id)
+                                }
+
+                                else if (localTask.isDeleted && !remoteTask.isDeleted) {
+                                    firestoreRepository.saveTaskToFirestore(localTask)
+                                }
+
+                                else if (localTask != remoteTask) {
                                     todoRepository.updateTask(remoteTask)
                                 }
                             }

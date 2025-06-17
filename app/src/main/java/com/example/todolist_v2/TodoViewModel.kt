@@ -1,10 +1,12 @@
 package com.example.todolist_v2
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.todolist_v2.data_models.SubTask
 import com.example.todolist_v2.data_models.Task
 import com.example.todolist_v2.data_models.ToDoList
+import com.example.todolist_v2.repository.FirestoreRepository
 import com.example.todolist_v2.repository.ToDoRepository
 import com.google.firebase.auth.FirebaseAuth
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -13,7 +15,6 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import java.util.UUID
 import javax.inject.Inject
-import com.example.todolist_v2.repository.FirestoreRepository
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @HiltViewModel
@@ -29,7 +30,7 @@ class TodoViewModel @Inject constructor(
     val currentOwnerId = _currentOwnerId.asStateFlow()
 
     val toDoLists: StateFlow<List<ToDoList>> = _currentOwnerId.flatMapLatest { ownerId ->
-        repository.getListsByOwner(ownerId)
+        repository.getActiveListsByOwner(ownerId)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private val _selectedListId = MutableStateFlow<UUID?>(null)
@@ -56,6 +57,8 @@ class TodoViewModel @Inject constructor(
             toDoLists.collect { lists ->
                 if ((_selectedListId.value == null || lists.none { it.id == _selectedListId.value }) && lists.isNotEmpty()) {
                     _selectedListId.value = lists.firstOrNull()?.id
+                } else if (lists.isEmpty()) {
+                    _selectedListId.value = null
                 }
             }
         }
@@ -65,16 +68,25 @@ class TodoViewModel @Inject constructor(
         if (listId == null) return
         viewModelScope.launch {
             repository.getListById(listId)?.let { list ->
-                repository.updateList(list.copy(lastModified = System.currentTimeMillis()))
+                val updatedList = list.copy(lastModified = System.currentTimeMillis())
+                repository.updateList(updatedList)
+                if (currentOwnerId.value != LOCAL_USER_ID) {
+                    firestoreRepository.saveToDoListToFirestore(updatedList)
+                }
             }
         }
     }
 
     private fun updateTask(task: Task) {
         viewModelScope.launch {
+
             repository.updateTask(task)
+
+            if (currentOwnerId.value != LOCAL_USER_ID) {
+                firestoreRepository.saveTaskToFirestore(task)
+            }
+
             touchList(task.listId)
-            firestoreRepository.saveTaskToFirestore(task)
         }
     }
 
@@ -87,6 +99,10 @@ class TodoViewModel @Inject constructor(
             viewModelScope.launch {
                 val newList = ToDoList(name = name, owner = currentOwnerId.value)
                 repository.insertList(newList)
+
+                if (currentOwnerId.value != LOCAL_USER_ID) {
+                    firestoreRepository.saveToDoListToFirestore(newList)
+                }
                 _selectedListId.value = newList.id
             }
         }
@@ -95,20 +111,29 @@ class TodoViewModel @Inject constructor(
     fun renameList(listId: UUID, newName: String) = viewModelScope.launch {
         if (newName.isBlank()) return@launch
         repository.getListById(listId)?.let {
-            repository.updateList(it.copy(name = newName, lastModified = System.currentTimeMillis()))
+            val updatedList = it.copy(name = newName, lastModified = System.currentTimeMillis())
+            repository.updateList(updatedList)
+            if (currentOwnerId.value != LOCAL_USER_ID) {
+                firestoreRepository.saveToDoListToFirestore(updatedList)
+            }
         }
     }
+
 
     fun deleteList(list: ToDoList) = viewModelScope.launch {
         if (_selectedListId.value == list.id) {
             _selectedListId.value = toDoLists.value.firstOrNull { it.id != list.id }?.id
         }
-        val deletedList = list.copy(isDeleted = true, lastModified = System.currentTimeMillis())
 
-        // Aktualizujemy lokalną bazę, aby UI odświeżyło się natychmiast
-        repository.updateList(deletedList)
-        // Natychmiast wysyłamy zmianę do Firestore, aby uniknąć "zmartwychwstania"
-        firestoreRepository.saveToDoListToFirestore(deletedList)
+
+        repository.softDeleteList(list)
+
+
+        if (currentOwnerId.value != LOCAL_USER_ID) {
+
+            val deletedListForFirestore = list.copy(isDeleted = true, lastModified = System.currentTimeMillis())
+            firestoreRepository.saveToDoListToFirestore(deletedListForFirestore)
+        }
     }
 
     fun addTask(title: String) {
@@ -116,7 +141,13 @@ class TodoViewModel @Inject constructor(
         if (title.isNotBlank()) {
             viewModelScope.launch {
                 val newTask = Task(listId = currentListId, title = title, inListOrder = tasks.value.size)
+
                 repository.insertTask(newTask)
+
+                if (currentOwnerId.value != LOCAL_USER_ID) {
+                    firestoreRepository.saveTaskToFirestore(newTask)
+                }
+
                 touchList(currentListId)
             }
         }
@@ -125,21 +156,32 @@ class TodoViewModel @Inject constructor(
     fun deleteTask(taskId: UUID) = viewModelScope.launch {
         repository.getTaskById(taskId)?.let { task ->
             val deletedTask = task.copy(isDeleted = true)
-            // W tym przypadku wystarczy wywołać updateTask, który już zapisuje zmiany
-            // Ale dla pewności i spójności, możemy jawnie wysłać do Firestore.
-            updateTask(deletedTask) // To zaktualizuje lokalnie
-            firestoreRepository.saveTaskToFirestore(deletedTask) // I wyślij do Firestore
+            updateTask(deletedTask) // updateTask zajmie się resztą (lokalna baza + firestore)
         }
     }
 
     fun moveTask(fromIndex: Int, toIndex: Int) {
         val list = tasks.value.toMutableList()
         if (fromIndex < 0 || fromIndex >= list.size || toIndex < 0 || toIndex >= list.size) return
+
         val itemToMove = list.removeAt(fromIndex)
         list.add(toIndex, itemToMove)
-        val reorderedTasks = list.mapIndexed { index, task -> task.copy(inListOrder = index) }
+
+        val reorderedTasks = list.mapIndexed { index, task ->
+            task.copy(inListOrder = index)
+        }
+
         viewModelScope.launch {
             repository.updateTasks(reorderedTasks)
+
+            if (currentOwnerId.value != LOCAL_USER_ID) {
+                try {
+                    firestoreRepository.saveTasksToFirestore(reorderedTasks)
+                } catch (e: Exception) {
+                    Log.e("TodoViewModel", "Błąd zapisu kolejności zadań w Firestore", e)
+                }
+            }
+
             touchList(_selectedListId.value)
         }
     }
